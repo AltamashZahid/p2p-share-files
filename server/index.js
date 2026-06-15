@@ -3,7 +3,11 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
 const CLIENT_ORIGINS = process.env.CLIENT_ORIGIN
   ? process.env.CLIENT_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean)
@@ -15,6 +19,23 @@ app.use(cors({ origin: CLIENT_ORIGINS }));
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'p2p-web-share-signaling' });
 });
+
+// ---------------------------------------------------------------------------
+// Serve the frontend production build when it exists (e.g. on Render).
+// In development the frontend is served by Vite, so this is a no-op.
+// ---------------------------------------------------------------------------
+const clientDistPath = path.join(__dirname, '..', 'client', 'dist');
+const indexHtmlPath = path.join(clientDistPath, 'index.html');
+
+if (fs.existsSync(clientDistPath)) {
+  app.use(express.static(clientDistPath));
+
+  // SPA fallback: serve index.html for any path that did not match a static
+  // file or an API route. This keeps client-side routing working.
+  app.get('*', (_req, res) => {
+    res.sendFile(indexHtmlPath);
+  });
+}
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -58,13 +79,25 @@ io.on('connection', (socket) => {
     }
   };
 
-  socket.on('create-room', (callback) => {
-    const roomId = uuidv4().slice(0, 8);
+  socket.on('create-room', (payload, callback) => {
+    const hasPayload = typeof payload === 'object' && payload !== null;
+    const ackCallback = hasPayload ? callback : payload;
+    const requestedRoomId = hasPayload ? payload.roomId : null;
+    const roomId =
+      typeof requestedRoomId === 'string' && requestedRoomId.trim()
+        ? requestedRoomId.trim()
+        : uuidv4().slice(0, 8);
+
+    if (rooms.has(roomId)) {
+      ack(ackCallback, { ok: false, error: 'Room already exists.' });
+      return;
+    }
+
     rooms.set(roomId, { senderId: socket.id });
     activeRoomId = roomId;
     role = 'sender';
     socket.join(roomId);
-    ack(callback, { roomId });
+    ack(ackCallback, { ok: true, roomId });
   });
 
   socket.on('join-room', (payload, callback) => {

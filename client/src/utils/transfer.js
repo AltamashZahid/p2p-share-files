@@ -2,7 +2,13 @@ export const CHUNK_SIZE = 64 * 1024;
 export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 export const ICE_SERVERS = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+  ],
 };
 
 export function formatBytes(bytes) {
@@ -30,9 +36,21 @@ export function readFileChunk(file, index) {
   return file.slice(start, end).arrayBuffer();
 }
 
+/**
+ * Build a shareable invite URL for a room.
+ * Works with HashRouter – the path is placed after the `#`.
+ */
 export function buildShareUrl(roomId) {
-  const base = window.location.origin;
-  return `${base}/join/${roomId}`;
+  const base = window.location.href.split('#')[0];
+  return `${base}#/join/${roomId}`;
+}
+
+export function generateRoomId() {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 export function triggerDownload(blob, fileName) {
