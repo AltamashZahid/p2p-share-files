@@ -4,6 +4,7 @@ import {
   MAX_FILE_SIZE,
   buildShareUrl,
   formatSpeed,
+  generateRoomId,
   hashBuffer,
   readFileChunk,
   triggerDownload,
@@ -50,6 +51,13 @@ export function useP2PShare({ mode, roomId }) {
   const receivedChunksRef = useRef(new Map());
   const metaRef = useRef(null);
   const speedTrackerRef = useRef({ lastBytes: 0, lastTime: Date.now() });
+
+  // Keep a ref that always reflects the latest connectionStatus.
+  // This lets callbacks read the current value without depending on the state
+  // variable, which would otherwise recreate the callbacks on every change
+  // and trigger the useEffect → cleanup → joinRoom loop.
+  const connectionStatusRef = useRef(connectionStatus);
+  connectionStatusRef.current = connectionStatus;
 
   const resetTransferState = useCallback(() => {
     setProgress(0);
@@ -133,6 +141,13 @@ export function useP2PShare({ mode, roomId }) {
         const buffer = await readFileChunk(file, index);
         const hash = await hashBuffer(buffer);
 
+        // Wait for the data channel buffer to drain before sending the next chunk.
+        // This prevents overwhelming the channel when the network is slower
+        // than the file read speed.
+        while (channel.bufferedAmount > CHUNK_SIZE * 8) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
         channel.send(
           JSON.stringify({ type: 'chunk-header', index, hash, size: buffer.byteLength }),
         );
@@ -205,6 +220,7 @@ export function useP2PShare({ mode, roomId }) {
         return;
       }
 
+      // Binary data — this is a file chunk following its header.
       const header = channelRef.current?._pendingHeader;
       if (!header) return;
 
@@ -247,12 +263,16 @@ export function useP2PShare({ mode, roomId }) {
     [finalizeDownload, updateSpeed],
   );
 
+  // FIX: Read connectionStatus from a ref instead of closing over the state
+  // variable. This removes connectionStatus from the dependency array, which
+  // prevents the cascade: setupDataChannelHandlers → startReceiverConnection →
+  // joinRoom → useEffect re-run → cleanup → rejoin → infinite loop.
   const setupDataChannelHandlers = useCallback(
     (channel) => {
       channel.binaryType = 'arraybuffer';
       channel.onmessage = handleIncomingMessage;
       channel.onclose = () => {
-        if (connectionStatus !== 'complete') {
+        if (connectionStatusRef.current !== 'complete') {
           handleDisconnect('channel_closed');
         }
       };
@@ -261,7 +281,7 @@ export function useP2PShare({ mode, roomId }) {
         setConnectionStatus('error');
       };
     },
-    [connectionStatus, handleDisconnect, handleIncomingMessage],
+    [handleDisconnect, handleIncomingMessage],
   );
 
   const startSenderConnection = useCallback(
@@ -359,34 +379,34 @@ export function useP2PShare({ mode, roomId }) {
     resetTransferState();
     setError('');
     setConnectionStatus('connecting');
-    setStatusMessage('Creating share room…');
+    const newRoomId = generateRoomId();
+    setActiveRoomId(newRoomId);
+    setShareUrl(buildShareUrl(newRoomId));
+    setStatusMessage('Share link ready. Registering room with signaling server…');
 
     const socket = createSignalingSocket();
     socketRef.current = socket;
 
+    socket.on('receiver-joined', async () => {
+      try {
+        await startSenderConnection(socket, newRoomId, fileRef.current);
+      } catch (err) {
+        setError(err.message || 'Sender connection failed.');
+        setConnectionStatus('error');
+      }
+    });
+
     socket.on('connect', () => {
-      socket.timeout(10000).emit('create-room', (err, response) => {
-        if (err || !response?.roomId) {
+      socket.timeout(10000).emit('create-room', { roomId: newRoomId }, (err, response) => {
+        if (err || !response?.ok) {
           setError('Signaling server did not create a room. Please try again.');
           setConnectionStatus('error');
-          setStatusMessage('');
+          setStatusMessage('Share link was generated, but the room is not active.');
           return;
         }
 
-        const { roomId: newRoomId } = response;
-        setActiveRoomId(newRoomId);
-        setShareUrl(buildShareUrl(newRoomId));
         setStatusMessage('Waiting for receiver to join…');
         setConnectionStatus('connecting');
-
-        socket.on('receiver-joined', async () => {
-          try {
-            await startSenderConnection(socket, newRoomId, fileRef.current);
-          } catch (err) {
-            setError(err.message || 'Sender connection failed.');
-            setConnectionStatus('error');
-          }
-        });
       });
     });
 
@@ -438,8 +458,8 @@ export function useP2PShare({ mode, roomId }) {
       startReceiverConnection(socket, roomId);
 
       socket.emit('join-room', { roomId }, (response) => {
-        if (!response.ok) {
-          setError(response.error || 'Unable to join room.');
+        if (!response?.ok) {
+          setError(response?.error || 'Unable to join room.');
           setConnectionStatus('error');
           return;
         }
