@@ -5,10 +5,12 @@ import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 
 const PORT = process.env.PORT || 3001;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+const CLIENT_ORIGINS = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean)
+  : true;
 
 const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(cors({ origin: CLIENT_ORIGINS }));
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'p2p-web-share-signaling' });
@@ -17,7 +19,7 @@ app.get('/health', (_req, res) => {
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: CLIENT_ORIGIN,
+    origin: CLIENT_ORIGINS,
     methods: ['GET', 'POST'],
   },
 });

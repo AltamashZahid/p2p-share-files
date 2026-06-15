@@ -348,12 +348,14 @@ export function useP2PShare({ mode, roomId }) {
   );
 
   const createRoom = useCallback(() => {
-    if (!fileRef.current) {
+    const file = fileRef.current;
+    if (!file) {
       setError('Select a file before creating a room.');
       return;
     }
 
     cleanup();
+    fileRef.current = file;
     resetTransferState();
     setError('');
     setConnectionStatus('connecting');
@@ -363,7 +365,15 @@ export function useP2PShare({ mode, roomId }) {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      socket.emit('create-room', async ({ roomId: newRoomId }) => {
+      socket.timeout(10000).emit('create-room', (err, response) => {
+        if (err || !response?.roomId) {
+          setError('Signaling server did not create a room. Please try again.');
+          setConnectionStatus('error');
+          setStatusMessage('');
+          return;
+        }
+
+        const { roomId: newRoomId } = response;
         setActiveRoomId(newRoomId);
         setShareUrl(buildShareUrl(newRoomId));
         setStatusMessage('Waiting for receiver to join…');
