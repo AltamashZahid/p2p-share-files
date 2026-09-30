@@ -1,245 +1,140 @@
 # P2P Web Share
 
-A lightweight browser-to-browser file sharing app built with React, Node.js, Socket.io, and WebRTC.
+A decentralized, end-to-end encrypted file-sharing web app. Files move directly between browsers over WebRTC data channels; a lightweight Node.js/Socket.io signaling server only introduces peers and never reads, processes or stores file data.
 
-Users can select a file, generate a share room link, send that link to another person, and transfer the file directly between browsers using a WebRTC data channel. The signaling server is used only for the initial WebRTC handshake and never stores, reads, or processes file data.
+- **Live demo:** _add your deployment URL here_
+- **Demo video:** _add your YouTube / Google Drive link here_
 
 ## Features
 
-- Drag-and-drop file selection.
-- File size limit under 50 MB.
-- Unique share room link generation.
-- Socket.io signaling server for WebRTC offer, answer, and ICE candidate exchange.
-- Direct peer-to-peer transfer using WebRTC data channels.
-- SHA-256 chunk verification for transfer integrity.
-- Transfer progress indicator.
-- Transfer speed display.
-- Connection status display.
-- Graceful disconnect handling.
-- Automatic file download on the receiver side.
+**Core**
+
+- Drag-and-drop (or click-to-browse) file selection and a unique invite link per room.
+- Node.js + Express + Socket.io signaling server that relays WebRTC offers, answers and ICE candidates.
+- Direct browser-to-browser transfer over WebRTC data channels, with backpressure.
+- SHA-256 verification of every chunk against the sender's manifest.
+- Live progress, download/upload speed, verified-chunk counter and connection status.
+- Graceful handling of closed tabs and dropped connections, with clear status messages.
+- Automatic download once every chunk is verified.
+
+**Advanced**
+
+| Feature | How it works |
+| --- | --- |
+| **Zero-knowledge encryption** | The sender's browser generates an AES-256-GCM key (Web Crypto API). Every chunk and control message is encrypted before it enters a data channel, with the chunk index bound as authenticated data. The key only travels in the link's fragment (`/?room=<id>#key=<key>`), which browsers never send to any server. |
+| **Multi-peer mesh swarming** | Every peer in a room connects to every other peer. Transfers are pull-based, like BitTorrent: each peer tracks a bitfield of verified chunks and announces new ones, and downloaders request different chunks from every peer that has them. A third peer downloads from the sender *and* the second peer at the same time. |
+| **Large files (>500 MB) via OPFS** | Receivers stream verified chunks straight to disk in the Origin Private File System, using `FileSystemSyncAccessHandle` in a worker. RAM use stays flat (a 600 MB transfer peaked at ~6 MB of JS heap), and the final download is a disk-backed file. |
+| **Churn recovery / auto-resume** | Receivers persist their verified-chunk bitfield next to the OPFS file. After a dropped connection, a refresh, or the sender coming back, the bitfield handshake resumes from the last verified chunk instead of 0%. Broken peer links retry with backoff, and the sender can refresh, re-select the same file and take its room back over. |
 
 ## Tech Stack
 
 | Layer | Technology |
 | --- | --- |
-| Frontend | React, Vite, Tailwind CSS |
-| Backend | Node.js, Express.js, Socket.io |
-| P2P Transfer | WebRTC Data Channels |
-| File Integrity | Web Crypto API, SHA-256 |
-
-## Project Structure
-
-```text
-p2p-web-share/
-|-- client/              React frontend
-|-- server/              Node.js signaling server
-|-- SUBMISSION_NOTES.md  Assignment and submission notes
-|-- package.json         Root helper scripts
-`-- README.md
-```
-
-## Local Setup
-
-### Prerequisites
-
-- Node.js 18 or newer
-- npm
-
-### Install Dependencies
-
-From the project root:
-
-```bash
-npm run install:all
-```
-
-Or install manually:
-
-```bash
-cd server
-npm install
-
-cd ../client
-npm install
-```
-
-### Start The Backend
-
-From the project root:
-
-```bash
-npm run dev:server
-```
-
-The signaling server runs at:
-
-```text
-http://localhost:3001
-```
-
-Health check:
-
-```text
-http://localhost:3001/health
-```
-
-### Start The Frontend
-
-Open a second terminal from the project root:
-
-```bash
-npm run dev:client
-```
-
-The frontend runs at:
-
-```text
-http://localhost:5173
-```
-
-If localhost does not open correctly on Windows, use:
-
-```text
-http://127.0.0.1:5173
-```
-
-## How To Use
-
-1. Open the frontend in one browser window.
-2. Drop or select a file under 50 MB.
-3. Click **Create share room**.
-4. Copy the generated invite link.
-5. Open the invite link in another browser window or another device.
-6. Wait for the peer connection.
-7. The receiver will automatically download the file after all chunks are verified.
+| Frontend | React 19, Vite, Tailwind CSS 4 |
+| P2P | WebRTC `RTCPeerConnection` + `RTCDataChannel` (no wrapper library) |
+| Crypto | Web Crypto API: AES-256-GCM, SHA-256 |
+| Storage | Origin Private File System (sync access handles in a Web Worker) |
+| Signaling | Node.js, Express, Socket.io |
 
 ## How It Works
 
 ```mermaid
 sequenceDiagram
-    participant Sender
-    participant SignalingServer
-    participant Receiver
+    participant S as Sender
+    participant SS as Signaling server
+    participant B as Peer B
+    participant C as Peer C
 
-    Sender->>SignalingServer: create-room
-    SignalingServer-->>Sender: roomId
-    Receiver->>SignalingServer: join-room
-    SignalingServer-->>Sender: receiver-joined
-    Sender->>SignalingServer: WebRTC offer
-    SignalingServer->>Receiver: WebRTC offer
-    Receiver->>SignalingServer: WebRTC answer
-    SignalingServer->>Sender: WebRTC answer
-    Sender->>Receiver: File chunks over WebRTC data channel
-    Receiver->>Receiver: Verify SHA-256 hashes
-    Receiver->>Receiver: Reassemble and auto-download file
+    S->>S: Hash every 128 KB chunk (manifest), generate AES key
+    S->>SS: create-room
+    B->>SS: join-room
+    SS-->>S: peer-joined
+    S-->>B: WebRTC offer / answer / ICE (relayed by server)
+    S->>B: hello, meta + manifest (encrypted)
+    B->>S: request chunks
+    S->>B: encrypted chunks
+    C->>SS: join-room
+    Note over S,C: C connects to both S and B
+    C->>S: request chunks 0..15
+    C->>B: request chunks 16..31
+    S->>C: encrypted chunks
+    B->>C: encrypted chunks
+    C->>C: decrypt, verify SHA-256, write to OPFS, announce "have"
 ```
 
-## Environment Variables
+### Protocol
 
-### Frontend
+All frames on a data channel are encrypted. Control frames carry JSON; chunk frames carry `[index][iv][AES-GCM ciphertext]`.
 
-Create `client/.env` if you want to override the signaling server URL:
+| Message | Purpose |
+| --- | --- |
+| `hello` | First message on every link: peer id, whether it knows the file, its bitfield |
+| `meta` + `manifest` | File name/size/chunk count and the SHA-256 of every chunk; `fileId` = hash of all hashes |
+| `bitfield` / `have` | Which chunks a peer has verified (full / incremental) |
+| `request` | "Send me these chunk indices" (up to 16 in flight per peer) |
+
+### Project Structure
 
 ```text
-VITE_SIGNALING_URL=http://localhost:3001
+client/src/
+|-- App.jsx                 Sender and receiver pages
+|-- hooks/useSwarm.js       React bindings for the swarm engine
+|-- components/             Drop zone, status/progress panels, peer list
+`-- lib/
+    |-- swarm.js            Swarm engine: mesh, scheduling, verification, seeding, resume
+    |-- peerLink.js         One RTCPeerConnection + data channel per remote peer
+    |-- protocol.js         Encrypted frame format
+    |-- crypto.js           AES-GCM key handling, encryption, SHA-256, link parsing
+    |-- manifest.js         Chunk hashing
+    |-- bitfield.js         Compact verified-chunk sets
+    |-- stores.js           Source file / OPFS / in-memory chunk stores
+    |-- opfs.worker.js      OPFS sync access handles (disk streaming)
+    |-- resume.js           Persisted resume state
+    |-- signaling.js        Socket.io client helpers
+    `-- config.js           Tunables, ICE servers, signaling URL
+server/index.js             Signaling server (rooms, relay, reconnection)
 ```
 
-### Backend
+## Local Setup
 
-Create `server/.env` if needed:
-
-```text
-PORT=3001
-CLIENT_ORIGIN=http://localhost:5173
-```
-
-`CLIENT_ORIGIN` can also be a comma-separated list:
-
-```text
-CLIENT_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
-```
-
-## Build
-
-From the project root:
+Requires Node.js 18+.
 
 ```bash
-npm run build
+npm run install:all   # install server and client dependencies
+npm run dev:server    # signaling server on http://localhost:3001
+npm run dev:client    # frontend on http://localhost:5173 (second terminal)
 ```
 
-This builds the frontend production files inside:
+Open http://localhost:5173, drop a file, click **Create share room**, then open the invite link in other browser windows or on other devices. Open the link in a third window while the second is still downloading to see swarming in the peer list.
 
-```text
-client/dist
-```
+## Configuration
+
+### Frontend (`client/.env`)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VITE_SIGNALING_URL` | same origin (prod) / `:3001` (dev) | Signaling server URL for split deployments |
+| `VITE_TURN_URL` | none | Optional TURN server(s), comma-separated, for networks that block direct connections |
+| `VITE_TURN_USERNAME`, `VITE_TURN_CREDENTIAL` | none | TURN credentials |
+
+### Backend (`server/.env`)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `3001` | Listen port |
+| `CLIENT_ORIGIN` | any | Allowed CORS origin(s), comma-separated |
 
 ## Deployment
 
-Recommended hosting:
+**Single service on Render (recommended).** `render.yaml` builds the frontend and serves it from the signaling server, so both share one origin and no environment variables are needed. Create a new Blueprint on Render pointing at this repository.
 
-- Frontend: Vercel or Netlify.
-- Backend: Render or Railway.
+**Split deployment.** Deploy `client/` to Vercel or Netlify (build `npm run build`, output `dist`, set `VITE_SIGNALING_URL`), and `server/` to Render or Railway (start `npm start`, set `CLIENT_ORIGIN`).
 
-### Frontend Deployment
+## Browser Support & Limits
 
-Use these settings for the `client` folder:
-
-```text
-Build command: npm run build
-Output directory: dist
-```
-
-Set this environment variable to your deployed backend URL:
-
-```text
-VITE_SIGNALING_URL=https://your-backend-url
-```
-
-### Backend Deployment
-
-Use these settings for the `server` folder:
-
-```text
-Start command: npm start
-```
-
-Set these environment variables:
-
-```text
-PORT=3001
-CLIENT_ORIGIN=https://your-frontend-url
-```
-
-## Submission Checklist
-
-- [x] React frontend
-- [x] Node.js + Socket.io signaling server
-- [x] WebRTC data channel transfer
-- [x] Room creation and join flow
-- [x] SHA-256 chunk verification
-- [x] Progress tracking UI
-- [x] Connection status UI
-- [x] Graceful disconnect handling
-- [x] Auto download on receiver side
-- [x] README.md
-- [ ] Deployment links
-- [ ] Demo video
-
-## Demo Video Requirement
-
-The project submission should include a demo video of about 3 minutes showing:
-
-- File selection.
-- Share link generation.
-- Receiver joining from another browser window or device.
-- Live transfer progress.
-- Automatic download after completion.
-
-The video can be uploaded to YouTube or Google Drive.
-
-## Important Note
-
-The signaling server only handles WebRTC connection setup. File data is transferred directly between browsers over WebRTC and is not uploaded to the server.
+- Chrome, Edge, Firefox and Safari 17+. OPFS streaming needs sync access handles; browsers without them fall back to in-memory storage, capped at 500 MB.
+- Rooms hold up to 8 peers (full mesh). Empty rooms are kept for 30 minutes so peers can come back and resume.
+- Without a TURN server, peers behind strict NATs or firewalls may be unable to connect directly.
 
 ## License
 
