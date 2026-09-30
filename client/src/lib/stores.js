@@ -3,6 +3,7 @@
 // Every store has the same interface: read(i), write(i, data), toFile(), close().
 // ---------------------------------------------------------------------------
 import { chunkLength } from './manifest.js';
+import { resumableRoomIds } from './resume.js';
 
 /** The sender's original file. Chunks are sliced straight from disk. */
 export class SourceFileStore {
@@ -141,14 +142,19 @@ export class OpfsChunkStore {
 
 let cleanedUp = false;
 
-/** Delete partial files left behind by earlier visits (once per page load). */
+/**
+ * Delete partial files left behind by earlier visits (once per page load),
+ * except ones that can still be resumed. Files are named `<roomId>-<fileId>.part`.
+ */
 async function removeOldParts(keepName) {
   if (cleanedUp) return;
   cleanedUp = true;
+  const resumable = resumableRoomIds();
   const names = await callWorker('list');
   await Promise.all(
     names
       .filter((name) => name.endsWith('.part') && name !== keepName)
+      .filter((name) => !resumable.has(name.split('-')[0]))
       .map((name) => callWorker('remove', { name })),
   );
 }
@@ -166,8 +172,9 @@ async function freeStorageBytes() {
  * Pick where a receiver keeps incoming chunks: OPFS on disk when the browser
  * supports it and there is room, otherwise RAM for files up to 500 MB.
  */
-export async function createChunkStore(meta, { roomId }) {
-  const free = await freeStorageBytes();
+export async function createChunkStore(meta, { roomId, resuming = false }) {
+  // When resuming, the partial file already holds its full size on disk.
+  const free = resuming ? Infinity : await freeStorageBytes();
 
   if (free >= meta.size && navigator.storage?.getDirectory) {
     const store = new OpfsChunkStore(meta, `${roomId}-${meta.fileId}.part`);

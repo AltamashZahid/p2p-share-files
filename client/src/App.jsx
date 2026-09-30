@@ -18,7 +18,8 @@ function ErrorBox({ message }) {
 }
 
 function SharePage() {
-  const { snapshot, preparing, shareUrl, error, share, stop } = useHostSession();
+  const { snapshot, preparing, shareUrl, error, resumeRecord, share, stop, discardResume } =
+    useHostSession();
   const [file, setFile] = useState(null);
   const [copied, setCopied] = useState(false);
   const sharing = Boolean(shareUrl);
@@ -42,6 +43,36 @@ function SharePage() {
         </p>
         <Badges storage={sharing ? 'source' : null} />
       </header>
+
+      {resumeRecord && !sharing ? (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+          <p className="font-medium text-amber-200">Resume sharing?</p>
+          <p className="mt-1 text-amber-100/80">
+            This tab was sharing <span className="font-medium">{resumeRecord.name}</span> (
+            {formatBytes(resumeRecord.size)}) in room{' '}
+            <span className="font-mono">{resumeRecord.roomId}</span>. Select the same file again
+            and peers carry on from the chunks they already verified.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => share(file, { resume: true })}
+              disabled={!file || busy}
+              className="rounded-lg bg-amber-400 px-4 py-2 font-semibold text-slate-950 hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {file ? `Resume sharing ${file.name}` : 'Resume sharing (select the file first)'}
+            </button>
+            <button
+              type="button"
+              onClick={discardResume}
+              disabled={busy}
+              className="rounded-lg border border-amber-500/40 px-4 py-2 text-amber-200 hover:border-amber-400"
+            >
+              Start fresh
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <FileDropZone onFileSelect={setFile} disabled={busy} />
       <SelectedFileCard file={file} />
@@ -125,6 +156,12 @@ function JoinPage({ roomId, keyString }) {
       </header>
 
       {snapshot ? <ConnectionStatus status={snapshot.status} message={snapshot.message} /> : null}
+      {snapshot?.resumedChunks ? (
+        <p className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
+          ↻ Resumed from your last session: {snapshot.resumedChunks} of {snapshot.totalChunks}{' '}
+          verified chunks restored from disk.
+        </p>
+      ) : null}
       <ProgressPanel snapshot={snapshot} />
 
       {download ? (

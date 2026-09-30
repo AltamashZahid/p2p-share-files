@@ -16,16 +16,28 @@ const CLIENT_ORIGINS = process.env.CLIENT_ORIGIN
 // other peer, so the cost grows with n². Eight is plenty for a swarm demo.
 const MAX_PEERS_PER_ROOM = 8;
 const ID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/;
+// Keep an empty room around for a while so peers that drop off (closed tab,
+// flaky network, sender refreshing the page) can come back and resume.
+const EMPTY_ROOM_TTL_MS = 30 * 60 * 1000;
 
 /**
- * roomId -> { hostPeerId, peers: Map<peerId, socketId> }
+ * roomId -> { hostPeerId, peers: Map<peerId, socketId>, expiryTimer }
  *
  * The server only ever sees opaque room and peer ids. File names, sizes,
  * encryption keys and file data travel exclusively over encrypted WebRTC
  * data channels between browsers.
- * @type {Map<string, { hostPeerId: string, peers: Map<string, string> }>}
+ * @type {Map<string, { hostPeerId: string, peers: Map<string, string>, expiryTimer?: NodeJS.Timeout }>}
  */
 const rooms = new Map();
+
+function scheduleRoomExpiry(roomId) {
+  const room = rooms.get(roomId);
+  clearTimeout(room.expiryTimer);
+  room.expiryTimer = setTimeout(() => {
+    if (rooms.get(roomId)?.peers.size === 0) rooms.delete(roomId);
+  }, EMPTY_ROOM_TTL_MS);
+  room.expiryTimer.unref?.();
+}
 
 const app = express();
 app.use(cors({ origin: CLIENT_ORIGINS }));
@@ -80,6 +92,7 @@ io.on('connection', (socket) => {
       io.sockets.sockets.get(previousSocketId)?.disconnect(true);
     }
 
+    clearTimeout(room.expiryTimer);
     room.peers.set(peerId, socket.id);
     session = { roomId, peerId };
     socket.join(roomId);
@@ -92,14 +105,19 @@ io.on('connection', (socket) => {
       ack(callback, { ok: false, error: 'Invalid room or peer id.' });
       return;
     }
-    if (rooms.has(roomId)) {
+    const existing = rooms.get(roomId);
+    // The original sender coming back (reconnect or page refresh) takes its
+    // room over again; anyone else is refused.
+    if (existing && existing.hostPeerId !== peerId) {
       ack(callback, { ok: false, error: 'Room already exists.' });
       return;
     }
+    if (!existing) rooms.set(roomId, { hostPeerId: peerId, peers: new Map() });
 
-    rooms.set(roomId, { hostPeerId: peerId, peers: new Map() });
+    const room = rooms.get(roomId);
+    const existingPeers = [...room.peers.keys()].filter((id) => id !== peerId);
     attach(roomId, peerId, nonce);
-    ack(callback, { ok: true, roomId, hostPeerId: peerId, peers: [] });
+    ack(callback, { ok: true, roomId, hostPeerId: peerId, peers: existingPeers });
   });
 
   socket.on('join-room', (payload, callback) => {
@@ -146,7 +164,7 @@ io.on('connection', (socket) => {
       room.peers.delete(peerId);
       socket.to(roomId).emit('peer-left', { peerId });
     }
-    if (room.peers.size === 0) rooms.delete(roomId);
+    if (room.peers.size === 0) scheduleRoomExpiry(roomId);
   });
 });
 
