@@ -1,33 +1,30 @@
 import { useState } from 'react';
 import FileDropZone, { SelectedFileCard } from './components/FileDropZone.jsx';
-import ConnectionStatus, { ProgressPanel } from './components/StatusPanels.jsx';
-import { useP2PShare } from './hooks/useP2PShare.js';
+import PeerList from './components/PeerList.jsx';
+import ConnectionStatus, { Badges, ProgressPanel } from './components/StatusPanels.jsx';
+import { useGuestSession, useHostSession } from './hooks/useSwarm.js';
 import { readShareLink } from './lib/crypto.js';
+import { formatBytes, formatSpeed } from './lib/format.js';
 
 const HOME_URL = window.location.pathname;
 
-function SharePage() {
-  const {
-    connectionStatus,
-    connectionLabel,
-    statusMessage,
-    shareUrl,
-    activeRoomId,
-    selectedFile,
-    progress,
-    speedLabel,
-    transferredBytes,
-    totalBytes,
-    error,
-    selectFile,
-    createRoom,
-  } = useP2PShare({ mode: 'sender' });
+function ErrorBox({ message }) {
+  if (!message) return null;
+  return (
+    <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-rose-200">
+      {message}
+    </div>
+  );
+}
 
+function SharePage() {
+  const { snapshot, preparing, shareUrl, error, share, stop } = useHostSession();
+  const [file, setFile] = useState(null);
   const [copied, setCopied] = useState(false);
-  const isBusy = ['connecting', 'connected', 'transferring'].includes(connectionStatus);
+  const sharing = Boolean(shareUrl);
+  const busy = preparing !== null || sharing;
 
   const copyLink = async () => {
-    if (!shareUrl) return;
     await navigator.clipboard.writeText(shareUrl);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -35,35 +32,40 @@ function SharePage() {
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-      <header className="space-y-2">
+      <header className="space-y-3">
         <p className="text-sm uppercase tracking-[0.2em] text-cyan-400">Sender</p>
         <h1 className="text-3xl font-bold">Share a file directly</h1>
         <p className="text-slate-400">
-          Drop a file, create a room, and send the invite link. Files transfer peer-to-peer
-          through WebRTC — the signaling server never sees your data.
+          Drop a file, create a room, and send the invite link. Everyone who opens it joins a
+          peer-to-peer swarm: they download from you <em>and</em> from each other. The signaling
+          server only introduces peers and never sees your data.
         </p>
-        <p className="text-sm text-emerald-300">
-          🔒 End-to-end encrypted with AES-256-GCM. The key lives only in the link&apos;s #fragment.
-        </p>
+        <Badges storage={sharing ? 'source' : null} />
       </header>
 
-      <FileDropZone onFileSelect={selectFile} disabled={isBusy} />
-      <SelectedFileCard file={selectedFile} />
+      <FileDropZone onFileSelect={setFile} disabled={busy} />
+      <SelectedFileCard file={file} />
 
-      <button
-        type="button"
-        onClick={createRoom}
-        disabled={!selectedFile || isBusy}
-        className="rounded-xl bg-cyan-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        Create share room
-      </button>
+      {!sharing ? (
+        <button
+          type="button"
+          onClick={() => share(file)}
+          disabled={!file || busy}
+          className="rounded-xl bg-cyan-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {preparing !== null
+            ? `Hashing chunks for verification… ${Math.floor(preparing * 100)}%`
+            : 'Create share room'}
+        </button>
+      ) : null}
 
-      {shareUrl ? (
+      {sharing ? (
         <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-4">
           <p className="text-sm text-slate-400">Invite link</p>
-          <p className="mt-2 break-all font-medium text-cyan-300">{shareUrl}</p>
-          <div className="mt-3 flex flex-wrap gap-3">
+          <p className="mt-2 break-all font-medium text-cyan-300" data-testid="share-url">
+            {shareUrl}
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <button
               type="button"
               onClick={copyLink}
@@ -71,79 +73,75 @@ function SharePage() {
             >
               {copied ? 'Copied!' : 'Copy link'}
             </button>
-            <p className="self-center text-sm text-slate-500">Room ID: {activeRoomId}</p>
+            <button
+              type="button"
+              onClick={() => {
+                stop();
+                setFile(null);
+              }}
+              className="rounded-lg border border-rose-500/40 px-4 py-2 text-sm text-rose-300 hover:border-rose-400"
+            >
+              Stop sharing
+            </button>
+            <p className="text-sm text-slate-500">Room {snapshot?.roomId}</p>
           </div>
+          <p className="mt-3 text-xs text-slate-500">
+            The part after <span className="font-mono">#key=</span> is the decryption key. Browsers
+            never send it to the server.
+          </p>
         </div>
       ) : null}
 
-      <ConnectionStatus
-        status={connectionStatus}
-        label={connectionLabel}
-        message={statusMessage}
-      />
-
-      <ProgressPanel
-        progress={progress}
-        speedLabel={speedLabel}
-        transferredBytes={transferredBytes}
-        totalBytes={totalBytes}
-        visible={connectionStatus === 'transferring' || connectionStatus === 'complete'}
-      />
-
-      {error ? (
-        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-rose-200">
-          {error}
-        </div>
+      {snapshot ? (
+        <>
+          <ConnectionStatus status={snapshot.status} message={snapshot.message} />
+          <div className="flex flex-wrap gap-x-5 gap-y-1 px-1 text-sm text-slate-400">
+            <span>↑ {formatSpeed(snapshot.uploadRate)}</span>
+            <span>{formatBytes(snapshot.uploadedTotal)} uploaded in total</span>
+          </div>
+          <PeerList peers={snapshot.peers} role="host" />
+        </>
       ) : null}
+
+      <ErrorBox message={error || snapshot?.error} />
     </div>
   );
 }
 
 function JoinPage({ roomId, keyString }) {
-  const {
-    connectionStatus,
-    connectionLabel,
-    statusMessage,
-    progress,
-    speedLabel,
-    transferredBytes,
-    totalBytes,
-    error,
-  } = useP2PShare({ mode: 'receiver', roomId, keyString });
+  const { snapshot, download, error } = useGuestSession(roomId, keyString);
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-      <header className="space-y-2">
+      <header className="space-y-3">
         <p className="text-sm uppercase tracking-[0.2em] text-blue-400">Receiver</p>
         <h1 className="text-3xl font-bold">Receiving shared file</h1>
         <p className="text-slate-400">
-          Connecting to room <span className="font-mono text-slate-200">{roomId}</span>. The
-          download will start automatically once all chunks are verified.
+          Room <span className="font-mono text-slate-200">{roomId}</span>. Chunks arrive from every
+          peer in the swarm, are decrypted and checked against the sender&apos;s SHA-256 manifest,
+          and the download starts automatically once all of them are verified.
         </p>
+        <Badges storage={snapshot?.storage} />
       </header>
 
-      <ConnectionStatus
-        status={connectionStatus}
-        label={connectionLabel}
-        message={statusMessage}
-      />
+      {snapshot ? <ConnectionStatus status={snapshot.status} message={snapshot.message} /> : null}
+      <ProgressPanel snapshot={snapshot} />
 
-      <ProgressPanel
-        progress={progress}
-        speedLabel={speedLabel}
-        transferredBytes={transferredBytes}
-        totalBytes={totalBytes}
-        visible={connectionStatus === 'transferring' || connectionStatus === 'complete'}
-      />
-
-      {error ? (
-        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-rose-200">
-          {error}
-        </div>
+      {download ? (
+        <a
+          href={download.url}
+          download={download.name}
+          className="rounded-xl bg-emerald-500 px-5 py-3 text-center font-semibold text-slate-950 hover:bg-emerald-400"
+        >
+          Save {download.name} again
+        </a>
       ) : null}
 
+      <PeerList peers={snapshot?.peers} role="guest" />
+      <ErrorBox message={error || snapshot?.error} />
+
       <a href={HOME_URL} className="text-sm text-cyan-400 hover:text-cyan-300">
-        ← Back to sender page
+        ← Share your own file
       </a>
     </div>
   );
@@ -159,7 +157,7 @@ export default function App() {
       <div className="mx-auto mb-10 flex max-w-5xl items-center justify-between">
         <div>
           <p className="text-xl font-bold">P2P Web Share</p>
-          <p className="text-sm text-slate-500">Browser-to-browser file transfer</p>
+          <p className="text-sm text-slate-500">Encrypted browser-to-browser swarm</p>
         </div>
         <a
           href={HOME_URL}
