@@ -41,7 +41,7 @@ export default function FileDropZone({ onFileSelect, disabled }) {
         onChange={(e) => handleFiles(e.target.files)}
       />
       <p className="text-lg font-medium">Drop a file here</p>
-      <p className="mt-2 text-sm text-slate-400">or click to browse</p>
+      <p className="mt-2 text-sm text-slate-400">or click to browse — any size; receivers stream large files straight to disk</p>
     </label>
   );
 }

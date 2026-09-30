@@ -420,7 +420,7 @@ export class SwarmSession {
       return;
     }
     try {
-      this.store = await createChunkStore(this.meta);
+      this.store = await createChunkStore(this.meta, { roomId: this.roomId });
     } catch (err) {
       this.fail(err.message);
       return;
