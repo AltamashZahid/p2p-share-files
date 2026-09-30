@@ -2,7 +2,6 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -13,11 +12,26 @@ const CLIENT_ORIGINS = process.env.CLIENT_ORIGIN
   ? process.env.CLIENT_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean)
   : true;
 
+// A room is a small full mesh: every peer holds a WebRTC connection to every
+// other peer, so the cost grows with n². Eight is plenty for a swarm demo.
+const MAX_PEERS_PER_ROOM = 8;
+const ID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/;
+
+/**
+ * roomId -> { hostPeerId, peers: Map<peerId, socketId> }
+ *
+ * The server only ever sees opaque room and peer ids. File names, sizes,
+ * encryption keys and file data travel exclusively over encrypted WebRTC
+ * data channels between browsers.
+ * @type {Map<string, { hostPeerId: string, peers: Map<string, string> }>}
+ */
+const rooms = new Map();
+
 const app = express();
 app.use(cors({ origin: CLIENT_ORIGINS }));
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'p2p-web-share-signaling' });
+  res.json({ status: 'ok', service: 'p2p-web-share-signaling', rooms: rooms.size });
 });
 
 // ---------------------------------------------------------------------------
@@ -29,9 +43,6 @@ const indexHtmlPath = path.join(clientDistPath, 'index.html');
 
 if (fs.existsSync(clientDistPath)) {
   app.use(express.static(clientDistPath));
-
-  // SPA fallback: serve index.html for any path that did not match a static
-  // file or an API route. This keeps client-side routing working.
   app.get('*', (_req, res) => {
     res.sendFile(indexHtmlPath);
   });
@@ -45,116 +56,97 @@ const io = new Server(httpServer, {
   },
 });
 
-/** @type {Map<string, { senderId: string, receiverId?: string }>} */
-const rooms = new Map();
-
-function getPeerSocket(roomId, excludeSocketId) {
-  const room = rooms.get(roomId);
-  if (!room) return null;
-
-  const targetId =
-    room.senderId === excludeSocketId ? room.receiverId : room.senderId;
-
-  return targetId ? io.sockets.sockets.get(targetId) ?? null : null;
-}
-
-function notifyPeerDisconnect(roomId, disconnectedSocketId, reason) {
-  const peer = getPeerSocket(roomId, disconnectedSocketId);
-  if (peer) {
-    peer.emit('peer-disconnected', { roomId, reason });
-  }
-}
-
-function cleanupRoom(roomId) {
-  rooms.delete(roomId);
-}
+const isValidId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
 
 io.on('connection', (socket) => {
-  let activeRoomId = null;
-  let role = null;
+  /** The room and peer identity this socket registered as. */
+  let session = null;
 
   const ack = (callback, payload) => {
-    if (typeof callback === 'function') {
-      callback(payload);
-    }
+    if (typeof callback === 'function') callback(payload);
   };
 
-  socket.on('create-room', (payload, callback) => {
-    const hasPayload = typeof payload === 'object' && payload !== null;
-    const ackCallback = hasPayload ? callback : payload;
-    const requestedRoomId = hasPayload ? payload.roomId : null;
-    const roomId =
-      typeof requestedRoomId === 'string' && requestedRoomId.trim()
-        ? requestedRoomId.trim()
-        : uuidv4().slice(0, 8);
+  /**
+   * Put this socket in the room under `peerId` and tell the other peers.
+   * `nonce` identifies the page load, so peers can tell a refresh (new nonce)
+   * from a signaling reconnect of the same page (same nonce).
+   */
+  function attach(roomId, peerId, nonce) {
+    const room = rooms.get(roomId);
+    const previousSocketId = room.peers.get(peerId);
 
+    // Same peer id coming back on a new socket: drop the stale one.
+    if (previousSocketId && previousSocketId !== socket.id) {
+      io.sockets.sockets.get(previousSocketId)?.disconnect(true);
+    }
+
+    room.peers.set(peerId, socket.id);
+    session = { roomId, peerId };
+    socket.join(roomId);
+    socket.to(roomId).emit('peer-joined', { peerId, nonce });
+  }
+
+  socket.on('create-room', (payload, callback) => {
+    const { roomId, peerId, nonce } = payload ?? {};
+    if (!isValidId(roomId) || !isValidId(peerId) || !isValidId(nonce)) {
+      ack(callback, { ok: false, error: 'Invalid room or peer id.' });
+      return;
+    }
     if (rooms.has(roomId)) {
-      ack(ackCallback, { ok: false, error: 'Room already exists.' });
+      ack(callback, { ok: false, error: 'Room already exists.' });
       return;
     }
 
-    rooms.set(roomId, { senderId: socket.id });
-    activeRoomId = roomId;
-    role = 'sender';
-    socket.join(roomId);
-    ack(ackCallback, { ok: true, roomId });
+    rooms.set(roomId, { hostPeerId: peerId, peers: new Map() });
+    attach(roomId, peerId, nonce);
+    ack(callback, { ok: true, roomId, hostPeerId: peerId, peers: [] });
   });
 
   socket.on('join-room', (payload, callback) => {
-    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
-    const room = rooms.get(roomId);
+    const { roomId, peerId, nonce } = payload ?? {};
+    if (!isValidId(roomId) || !isValidId(peerId) || !isValidId(nonce)) {
+      ack(callback, { ok: false, error: 'Invalid room or peer id.' });
+      return;
+    }
 
+    const room = rooms.get(roomId);
     if (!room) {
       ack(callback, { ok: false, error: 'Room not found or expired.' });
       return;
     }
-
-    if (room.receiverId) {
-      ack(callback, { ok: false, error: 'Room already has a receiver.' });
+    if (!room.peers.has(peerId) && room.peers.size >= MAX_PEERS_PER_ROOM) {
+      ack(callback, { ok: false, error: `Room is full (max ${MAX_PEERS_PER_ROOM} peers).` });
       return;
     }
 
-    room.receiverId = socket.id;
-    activeRoomId = roomId;
-    role = 'receiver';
-    socket.join(roomId);
+    const existingPeers = [...room.peers.keys()].filter((id) => id !== peerId);
+    attach(roomId, peerId, nonce);
+    ack(callback, { ok: true, roomId, hostPeerId: room.hostPeerId, peers: existingPeers });
+  });
 
-    const senderSocket = io.sockets.sockets.get(room.senderId);
-    if (senderSocket) {
-      senderSocket.emit('receiver-joined', { roomId, receiverId: socket.id });
+  // Relay an opaque WebRTC signal (SDP offer/answer or ICE candidate) to one
+  // specific peer in the same room.
+  socket.on('signal', (payload) => {
+    if (!session) return;
+    const { to, data } = payload ?? {};
+    const targetSocketId = rooms.get(session.roomId)?.peers.get(to);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('signal', { from: session.peerId, data });
     }
-
-    ack(callback, { ok: true, roomId });
-  });
-
-  socket.on('webrtc-offer', ({ roomId, offer }) => {
-    const peer = getPeerSocket(roomId, socket.id);
-    if (peer) peer.emit('webrtc-offer', { offer, from: socket.id });
-  });
-
-  socket.on('webrtc-answer', ({ roomId, answer }) => {
-    const peer = getPeerSocket(roomId, socket.id);
-    if (peer) peer.emit('webrtc-answer', { answer, from: socket.id });
-  });
-
-  socket.on('webrtc-ice-candidate', ({ roomId, candidate }) => {
-    const peer = getPeerSocket(roomId, socket.id);
-    if (peer) peer.emit('webrtc-ice-candidate', { candidate, from: socket.id });
   });
 
   socket.on('disconnect', () => {
-    if (!activeRoomId) return;
-
-    const room = rooms.get(activeRoomId);
+    if (!session) return;
+    const { roomId, peerId } = session;
+    const room = rooms.get(roomId);
     if (!room) return;
 
-    notifyPeerDisconnect(activeRoomId, socket.id, 'peer_disconnected');
-
-    if (role === 'sender') {
-      cleanupRoom(activeRoomId);
-    } else if (role === 'receiver') {
-      room.receiverId = undefined;
+    // Only remove the peer if a reconnect hasn't already replaced this socket.
+    if (room.peers.get(peerId) === socket.id) {
+      room.peers.delete(peerId);
+      socket.to(roomId).emit('peer-left', { peerId });
     }
+    if (room.peers.size === 0) rooms.delete(roomId);
   });
 });
 

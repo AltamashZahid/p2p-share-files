@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { formatBytes } from '../utils/transfer.js';
+import { formatBytes } from '../lib/format.js';
 
 export default function FileDropZone({ onFileSelect, disabled }) {
   const [isDragging, setIsDragging] = useState(false);
@@ -41,7 +41,7 @@ export default function FileDropZone({ onFileSelect, disabled }) {
         onChange={(e) => handleFiles(e.target.files)}
       />
       <p className="text-lg font-medium">Drop a file here</p>
-      <p className="mt-2 text-sm text-slate-400">or click to browse (max 50 MB)</p>
+      <p className="mt-2 text-sm text-slate-400">or click to browse</p>
     </label>
   );
 }
