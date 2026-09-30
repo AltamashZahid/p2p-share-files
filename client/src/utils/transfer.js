@@ -36,15 +36,6 @@ export function readFileChunk(file, index) {
   return file.slice(start, end).arrayBuffer();
 }
 
-/**
- * Build a shareable invite URL for a room.
- * Works with HashRouter – the path is placed after the `#`.
- */
-export function buildShareUrl(roomId) {
-  const base = window.location.href.split('#')[0];
-  return `${base}#/join/${roomId}`;
-}
-
 export function generateRoomId() {
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);

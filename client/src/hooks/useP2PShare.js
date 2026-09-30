@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CHUNK_SIZE,
   MAX_FILE_SIZE,
-  buildShareUrl,
   formatSpeed,
   generateRoomId,
   hashBuffer,
@@ -20,6 +19,22 @@ import {
   openDataChannelAsReceiver,
   waitForDataChannel,
 } from '../utils/webrtc.js';
+import {
+  buildShareUrl,
+  decrypt,
+  encrypt,
+  exportKey,
+  generateKey,
+  importKey,
+} from '../lib/crypto.js';
+
+// Additional authenticated data for a chunk: its index, so an encrypted chunk
+// cannot be swapped with another one without failing authentication.
+function chunkAad(index) {
+  const aad = new Uint8Array(4);
+  new DataView(aad.buffer).setUint32(0, index);
+  return aad;
+}
 
 const CONNECTION_LABELS = {
   idle: 'Idle',
@@ -31,7 +46,7 @@ const CONNECTION_LABELS = {
   disconnected: 'Disconnected',
 };
 
-export function useP2PShare({ mode, roomId }) {
+export function useP2PShare({ mode, roomId, keyString }) {
   const [connectionStatus, setConnectionStatus] = useState('idle');
   const [statusMessage, setStatusMessage] = useState('');
   const [shareUrl, setShareUrl] = useState('');
@@ -47,6 +62,7 @@ export function useP2PShare({ mode, roomId }) {
   const pcRef = useRef(null);
   const channelRef = useRef(null);
   const fileRef = useRef(null);
+  const keyRef = useRef(null); // AES-GCM key, never sent to the signaling server
   const ackWaitersRef = useRef(new Map());
   const receivedChunksRef = useRef(new Map());
   const metaRef = useRef(null);
@@ -139,7 +155,9 @@ export function useP2PShare({ mode, roomId }) {
 
       for (let index = 0; index < totalChunks; index += 1) {
         const buffer = await readFileChunk(file, index);
+        // Hash the plaintext (integrity), then encrypt it (confidentiality).
         const hash = await hashBuffer(buffer);
+        const encrypted = await encrypt(keyRef.current, buffer, chunkAad(index));
 
         // Wait for the data channel buffer to drain before sending the next chunk.
         // This prevents overwhelming the channel when the network is slower
@@ -151,7 +169,7 @@ export function useP2PShare({ mode, roomId }) {
         channel.send(
           JSON.stringify({ type: 'chunk-header', index, hash, size: buffer.byteLength }),
         );
-        channel.send(buffer);
+        channel.send(encrypted);
         await waitForChunkAck(index);
 
         const sentBytes = Math.min((index + 1) * CHUNK_SIZE, file.size);
@@ -224,7 +242,14 @@ export function useP2PShare({ mode, roomId }) {
       const header = channelRef.current?._pendingHeader;
       if (!header) return;
 
-      const buffer = event.data;
+      let buffer;
+      try {
+        buffer = await decrypt(keyRef.current, event.data, chunkAad(header.index));
+      } catch {
+        setError('Could not decrypt the file. The link is missing or has a wrong #key.');
+        setConnectionStatus('error');
+        return;
+      }
       const actualHash = await hashBuffer(buffer);
 
       if (actualHash !== header.hash) {
@@ -367,7 +392,7 @@ export function useP2PShare({ mode, roomId }) {
     [],
   );
 
-  const createRoom = useCallback(() => {
+  const createRoom = useCallback(async () => {
     const file = fileRef.current;
     if (!file) {
       setError('Select a file before creating a room.');
@@ -379,9 +404,13 @@ export function useP2PShare({ mode, roomId }) {
     resetTransferState();
     setError('');
     setConnectionStatus('connecting');
+
+    // Fresh key per room. It only ever lives in this tab and in the #fragment
+    // of the invite link.
+    keyRef.current = await generateKey();
     const newRoomId = generateRoomId();
     setActiveRoomId(newRoomId);
-    setShareUrl(buildShareUrl(newRoomId));
+    setShareUrl(buildShareUrl(newRoomId, await exportKey(keyRef.current)));
     setStatusMessage('Share link ready. Registering room with signaling server…');
 
     const socket = createSignalingSocket();
@@ -439,13 +468,26 @@ export function useP2PShare({ mode, roomId }) {
     startSenderConnection,
   ]);
 
-  const joinRoom = useCallback(() => {
+  const joinRoom = useCallback(async () => {
     if (!roomId) {
       setError('Invalid room link.');
       return;
     }
+    if (!keyString) {
+      setError('This link is missing its decryption key (#key=...). Ask the sender for the full link.');
+      setConnectionStatus('error');
+      return;
+    }
 
     cleanup();
+    try {
+      keyRef.current = await importKey(keyString);
+    } catch (err) {
+      setError(err.message);
+      setConnectionStatus('error');
+      return;
+    }
+
     resetTransferState();
     setError('');
     setConnectionStatus('connecting');
@@ -485,6 +527,7 @@ export function useP2PShare({ mode, roomId }) {
   }, [
     cleanup,
     handleDisconnect,
+    keyString,
     resetTransferState,
     roomId,
     startReceiverConnection,

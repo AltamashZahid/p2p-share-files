@@ -1,8 +1,10 @@
 import { useState } from 'react';
-import { Link, Route, Routes, useParams } from 'react-router-dom';
 import FileDropZone, { SelectedFileCard } from './components/FileDropZone.jsx';
 import ConnectionStatus, { ProgressPanel } from './components/StatusPanels.jsx';
 import { useP2PShare } from './hooks/useP2PShare.js';
+import { readShareLink } from './lib/crypto.js';
+
+const HOME_URL = window.location.pathname;
 
 function SharePage() {
   const {
@@ -39,6 +41,9 @@ function SharePage() {
         <p className="text-slate-400">
           Drop a file, create a room, and send the invite link. Files transfer peer-to-peer
           through WebRTC — the signaling server never sees your data.
+        </p>
+        <p className="text-sm text-emerald-300">
+          🔒 End-to-end encrypted with AES-256-GCM. The key lives only in the link&apos;s #fragment.
         </p>
       </header>
 
@@ -94,7 +99,7 @@ function SharePage() {
   );
 }
 
-function JoinPage({ roomId }) {
+function JoinPage({ roomId, keyString }) {
   const {
     connectionStatus,
     connectionLabel,
@@ -104,7 +109,7 @@ function JoinPage({ roomId }) {
     transferredBytes,
     totalBytes,
     error,
-  } = useP2PShare({ mode: 'receiver', roomId });
+  } = useP2PShare({ mode: 'receiver', roomId, keyString });
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
@@ -137,14 +142,18 @@ function JoinPage({ roomId }) {
         </div>
       ) : null}
 
-      <Link to="/" className="text-sm text-cyan-400 hover:text-cyan-300">
+      <a href={HOME_URL} className="text-sm text-cyan-400 hover:text-cyan-300">
         ← Back to sender page
-      </Link>
+      </a>
     </div>
   );
 }
 
 export default function App() {
+  // Invite links look like `/?room=<id>#key=<aes-key>`. The fragment is never
+  // sent to any server.
+  const { roomId, keyString } = readShareLink();
+
   return (
     <div className="min-h-screen px-4 py-10">
       <div className="mx-auto mb-10 flex max-w-5xl items-center justify-between">
@@ -152,23 +161,15 @@ export default function App() {
           <p className="text-xl font-bold">P2P Web Share</p>
           <p className="text-sm text-slate-500">Browser-to-browser file transfer</p>
         </div>
-        <Link
-          to="/"
+        <a
+          href={HOME_URL}
           className="rounded-lg border border-slate-800 px-4 py-2 text-sm hover:border-slate-600"
         >
           Home
-        </Link>
+        </a>
       </div>
 
-      <Routes>
-        <Route path="/" element={<SharePage />} />
-        <Route path="/join/:roomId" element={<JoinPageWrapper />} />
-      </Routes>
+      {roomId ? <JoinPage roomId={roomId} keyString={keyString} /> : <SharePage />}
     </div>
   );
-}
-
-function JoinPageWrapper() {
-  const { roomId } = useParams();
-  return <JoinPage roomId={roomId} />;
 }
