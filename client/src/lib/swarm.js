@@ -12,6 +12,10 @@
 //      from the second peer simultaneously.
 //   4. Each chunk is decrypted, checked against the manifest hash, stored, and
 //      immediately offered to the rest of the swarm.
+//
+// Churn recovery: dropped links are retried with backoff, and the verified
+// bitfield is persisted (resume.js), so after a dropped connection, a refresh
+// or the sender coming back, a download resumes from the last verified chunk.
 // ---------------------------------------------------------------------------
 import { Bitfield } from './bitfield.js';
 import {
@@ -25,10 +29,14 @@ import { RateMeter } from './format.js';
 import { chunkLength, computeFileId } from './manifest.js';
 import { PeerLink } from './peerLink.js';
 import { decodeFrame, encodeChunk, encodeControl } from './protocol.js';
+import { loadResumeRecord, saveResumeRecord } from './resume.js';
 import { connectSignaling, randomId, request } from './signaling.js';
 import { SourceFileStore, createChunkStore } from './stores.js';
 
 const TICK_MS = 250;
+const PERSIST_INTERVAL_MS = 1000;
+const RETRY_BASE_MS = 1000;
+const RETRY_MAX_MS = 10_000;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
 export class SwarmSession {
@@ -41,7 +49,8 @@ export class SwarmSession {
    * @param {File} [options.file]        host only: the file being shared
    * @param {object} [options.manifest]  host only: output of buildManifest()
    * @param {(snapshot: object) => void} options.onUpdate  UI state, ~4x per second
-   * @param {(file: File) => void} [options.onComplete]    guest: verified file ready
+   * @param {(file: File, info: { resumed: boolean }) => void} [options.onComplete]
+   *        guest: verified file ready (`resumed` = it was already complete on arrival)
    */
   constructor(options) {
     this.role = options.role;
@@ -72,6 +81,10 @@ export class SwarmSession {
     this.inflight = new Map(); // chunk index -> { peerId, at }
     this.cursor = 0; // every chunk below this index is already verified
     this.pendingHaves = [];
+    this.resumedChunks = 0; // chunks restored from a previous session
+    this.resumeDirty = false;
+    this.persisting = false;
+    this.lastPersist = 0;
     this.downloadMeter = new RateMeter();
     this.uploadMeter = new RateMeter();
 
@@ -116,13 +129,18 @@ export class SwarmSession {
     socket.on('signal', ({ from, data }) => this.onSignal(from, data));
 
     this.timer = setInterval(() => this.tick(), TICK_MS);
+    // Save progress synchronously if the tab is closed or refreshed.
+    this.onPageHide = () => this.persistNow();
+    window.addEventListener('pagehide', this.onPageHide);
     this.emit();
   }
 
   destroy() {
     if (this.destroyed) return;
+    this.persistNow();
     this.destroyed = true;
     clearInterval(this.timer);
+    window.removeEventListener('pagehide', this.onPageHide);
     for (const link of this.links.values()) link.close();
     this.links.clear();
     this.socket?.disconnect();
@@ -179,6 +197,7 @@ export class SwarmSession {
     if (existing && !existing.closed) return;
     const peer = this.peerState(remoteId);
     if (peer.state === 'banned' || peer.state === 'bad-key') return;
+    if (Date.now() < peer.retryAt) return; // backing off after a failure
 
     // The lower peer id makes the offer; the other side waits for it.
     if (this.peerId < remoteId) {
@@ -249,6 +268,8 @@ export class SwarmSession {
         downloaded: 0, // bytes we got from them
         uploaded: 0, // bytes we sent to them
         corrupt: 0,
+        retries: 0, // consecutive failed connection attempts
+        retryAt: 0, // don't try again before this time
       };
       this.peers.set(peerId, peer);
     }
@@ -258,6 +279,8 @@ export class SwarmSession {
   onLinkOpen(link) {
     const peer = this.peerState(link.remoteId);
     peer.state = 'connected';
+    peer.retries = 0;
+    peer.retryAt = 0;
     this.sendControl(link, {
       t: 'hello',
       peerId: this.peerId,
@@ -275,6 +298,10 @@ export class SwarmSession {
     const peer = this.peers.get(link.remoteId);
     if (peer && peer.state !== 'banned' && peer.state !== 'bad-key') {
       peer.state = 'disconnected';
+      // Retry with exponential backoff while the peer is still in the room
+      // (tick() calls ensureLink once retryAt has passed).
+      peer.retryAt = Date.now() + Math.min(RETRY_BASE_MS * 2 ** peer.retries, RETRY_MAX_MS);
+      peer.retries += 1;
     }
     this.releaseRequests(link.remoteId);
     this.schedule();
@@ -419,19 +446,33 @@ export class SwarmSession {
       this.fail('The file manifest failed verification.');
       return;
     }
+    const saved = loadResumeRecord(this.roomId);
+    const resumable = saved?.fileId === this.meta.fileId ? saved : null;
     try {
-      this.store = await createChunkStore(this.meta, { roomId: this.roomId });
+      this.store = await createChunkStore(this.meta, {
+        roomId: this.roomId,
+        resuming: Boolean(resumable),
+      });
     } catch (err) {
       this.fail(err.message);
       return;
     }
     if (this.destroyed) return;
-    this.onReady();
+    this.onReady(resumable);
   }
 
-  /** Manifest verified and storage open: start downloading. */
-  onReady() {
+  /** Manifest verified and storage open: start (or resume) downloading. */
+  onReady(resumable) {
     this.have = new Bitfield(this.meta.totalChunks);
+    // Chunks verified in an earlier session are still on disk: keep them.
+    if (resumable && this.store.kind === 'opfs') {
+      try {
+        this.have = Bitfield.fromBase64(this.meta.totalChunks, resumable.have);
+        this.resumedChunks = this.have.count;
+      } catch {
+        /* corrupt record: start from scratch */
+      }
+    }
     this.ready = true;
     this.preparing = false;
 
@@ -451,6 +492,10 @@ export class SwarmSession {
       if (!peer.hasMeta) this.sendMetadata(link, peer);
     }
 
+    if (this.have.complete) {
+      this.finish({ resumed: true });
+      return;
+    }
     this.schedule();
     this.emit();
   }
@@ -518,18 +563,53 @@ export class SwarmSession {
     peer.downloaded += length;
     this.downloadMeter.add(length);
     this.pendingHaves.push(index);
+    this.resumeDirty = true;
 
-    if (this.have.complete) await this.finish();
+    if (this.have.complete) await this.finish({ resumed: false });
     else if (peer.inflight.size <= REQUEST_WINDOW / 2) this.schedule();
   }
 
-  async finish() {
+  async finish({ resumed }) {
     this.completed = true;
     this.flushHaves();
+    this.persistNow();
     const file = await this.store.toFile();
     if (this.destroyed) return;
-    this.onComplete?.(file);
+    this.onComplete?.(file, { resumed });
     this.emit();
+  }
+
+  // ------------------------------------------------------------ auto-resume
+
+  get canResume() {
+    return this.role === 'guest' && this.ready && this.store?.kind === 'opfs';
+  }
+
+  /**
+   * Save the verified bitfield. It is captured before the OPFS flush is
+   * queued, so every chunk it lists is already written and flushed.
+   */
+  async persist() {
+    if (!this.canResume || this.persisting || !this.resumeDirty) return;
+    this.persisting = true;
+    this.resumeDirty = false;
+    const have = this.have.toBase64();
+    try {
+      if (!this.completed) await this.store.flush();
+      saveResumeRecord(this.roomId, this.meta.fileId, have);
+    } catch {
+      this.resumeDirty = true;
+    } finally {
+      this.persisting = false;
+      this.lastPersist = Date.now();
+    }
+  }
+
+  /** Synchronous save for page unload (the chunks are already in the file). */
+  persistNow() {
+    if (!this.canResume || this.destroyed) return;
+    saveResumeRecord(this.roomId, this.meta.fileId, this.have.toBase64());
+    this.resumeDirty = false;
   }
 
   // ------------------------------------------------------------------ upload
@@ -574,8 +654,14 @@ export class SwarmSession {
 
   tick() {
     if (this.destroyed) return;
+    const now = Date.now();
+
+    // Reconnect to anyone in the room we have no working link to.
+    for (const peerId of this.members) this.ensureLink(peerId);
+
+    if (this.resumeDirty && now - this.lastPersist > PERSIST_INTERVAL_MS) this.persist();
+
     if (this.ready && !this.completed) {
-      const now = Date.now();
       for (const [index, req] of this.inflight) {
         if (now - req.at > REQUEST_TIMEOUT_MS) {
           this.inflight.delete(index);
@@ -640,9 +726,12 @@ export class SwarmSession {
       return false;
     });
     if (canProgress) return { status: 'transferring', message: `Downloading ${this.meta.name}${signalNote}` };
+    const saved = this.canResume ? ' Progress is saved and the download' : ' The download';
     return {
       status: 'stalled',
-      message: 'No connected peer has the remaining chunks. Waiting for the sender to come back…',
+      message:
+        'Connection lost: no connected peer has the remaining chunks. Waiting for the sender to come back…' +
+        `${saved} resumes automatically from the last verified chunk.`,
     };
   }
 
@@ -651,8 +740,10 @@ export class SwarmSession {
     const peers = [...this.peers.values()].map((peer) => {
       const open = Boolean(this.links.get(peer.id)?.isOpen);
       let state = peer.state;
-      if (!open && state === 'connected') state = 'disconnected';
-      if (!open && !this.members.has(peer.id) && state !== 'banned' && state !== 'bad-key') state = 'left';
+      if (!open && state !== 'banned' && state !== 'bad-key') {
+        if (!this.members.has(peer.id)) state = 'left';
+        else if (state !== 'connecting' || peer.retries > 0) state = 'reconnecting';
+      }
       return {
         id: peer.id,
         isHost: peer.isHost,
@@ -673,6 +764,7 @@ export class SwarmSession {
         ? { name: this.meta.name, size: this.meta.size, totalChunks: total, chunkSize: this.meta.chunkSize }
         : null,
       verifiedChunks: this.have?.count ?? 0,
+      resumedChunks: this.resumedChunks,
       totalChunks: total,
       progress: total && this.have ? this.have.count / total : 0,
       bytesVerified: this.bytesVerified(),
