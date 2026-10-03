@@ -1,6 +1,7 @@
-# Build output
+node_modules/
+dist/
 build/
-
-# Downloads in progress and resume state from local test runs
-*.part
-.p2pshare-*.json
+.env
+.env.local
+*.log
+.DS_Store
