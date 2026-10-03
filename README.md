@@ -19,6 +19,18 @@ Drop a file, get an invite link, and anyone who opens it downloads the file dire
 - **Large files (>500 MB) via OPFS:** incoming chunks stream straight to disk, so RAM stays flat whatever the file size.
 - **Churn recovery and auto-resume:** after a dropped connection, a closed tab or a refresh, the download picks up from the last verified chunk instead of 0%.
 
+## Two Implementations
+
+| | Web app (this page) | Native C++ ([`native/`](native/README.md)) |
+| --- | --- | --- |
+| Runs as | Website: React + Node.js/Socket.io | Command-line tool + C++ signaling server |
+| WebRTC | Browser `RTCDataChannel` | libdatachannel |
+| Crypto | Web Crypto API | OpenSSL |
+| Large files | Origin Private File System | Positional writes to a `.part` file |
+| Resume state | localStorage | State file next to the download |
+
+Both implement the same features and the same encrypted frame format. See [native/README.md](native/README.md) for the C++17 version.
+
 ---
 
 ## How It Works
