@@ -13,6 +13,11 @@
 //   4. Each chunk is decrypted, checked against the manifest hash, written to
 //      disk at its offset, and immediately offered to the rest of the swarm.
 //
+// Churn recovery: dropped links are retried with backoff, P2P links survive
+// signaling outages, and a guest persists its verified bitfield (resume.hpp),
+// so after a dropped connection or a restart the download resumes from the
+// last verified chunk.
+//
 // All methods run on the EventLoop thread (see event_loop.hpp).
 // ---------------------------------------------------------------------------
 
@@ -55,6 +60,10 @@ struct SwarmOptions {
   // Guest only
   std::filesystem::path outputDir = ".";
 };
+
+/** A guest's peer id for a room: reused from its resume state so a restarted
+ * download rejoins as the same peer, otherwise freshly generated. */
+std::string guestPeerId(const std::filesystem::path& outputDir, const std::string& roomId);
 
 struct PeerSnapshot {
   std::string id;
@@ -151,6 +160,7 @@ class Swarm {
   void releaseRequests(const std::string& peerId);
   void onChunk(const std::shared_ptr<Link>& link, Peer& peer, uint32_t index, const Bytes& data);
   void finish();
+  void persist();
   void enqueueUploads(Peer& peer, const nlohmann::json& indices);
   void pumpUploads(const std::string& remoteId);
   void flushHaves();
@@ -168,6 +178,8 @@ class Swarm {
   const std::string nonce_;  // distinguishes this run from an earlier one with the same peer id
   std::unique_ptr<SignalingClient> signaling_;
   bool registered_ = false;
+  bool everRegistered_ = false;  // joined successfully at least once
+  Clock::time_point startedAt_{};
   bool stopped_ = false;
 
   std::set<std::string> members_;  // peer ids the signaling server says are in the room
@@ -187,6 +199,8 @@ class Swarm {
   bool completed_ = false;
   std::optional<std::filesystem::path> savedTo_;
   uint32_t resumedChunks_ = 0;
+  bool resumeDirty_ = false;
+  Clock::time_point lastPersist_{};
 
   std::map<uint32_t, std::pair<std::string, Clock::time_point>> inflight_;  // chunk -> (peer, requested at)
   uint32_t cursor_ = 0;  // every chunk below this index is verified

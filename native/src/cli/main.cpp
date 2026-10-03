@@ -228,7 +228,8 @@ int get(int argc, char** argv) {
     std::cerr << "The link's #key is malformed." << std::endl;
     return 1;
   }
-  options.peerId = randomId(8);
+  // Reuse the peer id from an earlier run of this download, so it resumes.
+  options.peerId = guestPeerId(options.outputDir, options.roomId);
 
   std::cout << "Joining room " << link->roomId << " via " << link->serverUrl << "\n"
             << "Saving to " << fs::absolute(options.outputDir).string() << "\n\n";

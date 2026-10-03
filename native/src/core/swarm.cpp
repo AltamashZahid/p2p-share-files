@@ -1,8 +1,10 @@
 #include "core/swarm.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 #include "core/protocol.hpp"
+#include "core/resume.hpp"
 
 namespace p2p {
 
@@ -16,6 +18,7 @@ constexpr uint32_t kRequestWindow = 16;  // max chunks requested from one peer a
 constexpr auto kRequestTimeout = 20s;    // re-request elsewhere after this
 constexpr auto kConnectTimeout = 20s;    // a link that never opens counts as failed
 constexpr auto kDisconnectGrace = 5s;    // "disconnected" is often a transient blip
+constexpr auto kLeftPeerSilence = 3s;    // peer left the room and went quiet: it's gone
 constexpr size_t kManifestBatch = 1500;  // hashes per manifest message (~100 KB)
 constexpr size_t kHighWaterMark = 4 * 1024 * 1024;
 constexpr size_t kLowWaterMark = 1 * 1024 * 1024;
@@ -23,6 +26,12 @@ constexpr int kMaxCorruptChunks = 3;
 constexpr auto kRetryBase = 1000ms;
 constexpr auto kRetryMax = 10000ms;
 constexpr size_t kMaxMessageSize = 256 * 1024;
+constexpr auto kPersistInterval = 1s;
+
+bool isValidPeerIdText(const std::string& text) {
+  return text.size() >= 4 && text.size() <= 64 &&
+         std::all_of(text.begin(), text.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_'; });
+}
 
 bool isHashHex(const std::string& text) {
   return text.size() == 64 &&
@@ -37,6 +46,11 @@ std::string stringOrEmpty(const json& message, const char* key) {
 }  // namespace
 
 // ------------------------------------------------------------------ helpers
+
+std::string guestPeerId(const std::filesystem::path& outputDir, const std::string& roomId) {
+  const auto state = loadResumeState(outputDir, roomId);
+  return state && isValidPeerIdText(state->peerId) ? state->peerId : randomId(8);
+}
 
 void RateMeter::add(uint64_t bytes) {
   samples_.emplace_back(std::chrono::steady_clock::now(), bytes);
@@ -63,6 +77,7 @@ struct Swarm::Link {
   std::vector<rtc::Candidate> pendingCandidates;  // ICE that arrived before the SDP
   std::string remoteNonce;
   Clock::time_point createdAt = Clock::now();
+  Clock::time_point lastActivity = Clock::now();  // last frame received
   std::optional<Clock::time_point> disconnectedAt;
 };
 
@@ -91,6 +106,7 @@ Swarm::~Swarm() { shutdown(); }
 // ---------------------------------------------------------------- lifecycle
 
 void Swarm::start() {
+  startedAt_ = Clock::now();
   if (options_.role == Role::Host) {
     meta_ = options_.manifest->meta;
     hashes_ = options_.manifest->hashes;
@@ -119,7 +135,7 @@ void Swarm::shutdown() {
   if (signaling_) signaling_->stop();
   for (auto& [id, link] : links_) closeLink(*link);
   links_.clear();
-  if (part_) part_->flush();
+  persist();  // save progress so the next run resumes
 }
 
 void Swarm::fail(const std::string& message) {
@@ -150,10 +166,20 @@ void Swarm::registerInRoom() {
       return;
     }
     if (!response->value("ok", false)) {
-      fail(response->value("error", std::string("Could not join the room.")));
+      const std::string error = response->value("error", std::string("Could not join the room."));
+      if (!everRegistered_) {
+        fail(error);  // wrong or expired link
+        return;
+      }
+      // We were in this room before, so the signaling server probably restarted
+      // and lost it. Keep trying: the sender re-creates it when it reconnects.
+      loop_.postDelayed(3s, [this] {
+        if (!stopped_ && !registered_ && signaling_->connected()) registerInRoom();
+      });
       return;
     }
     registered_ = true;
+    everRegistered_ = true;
     hostPeerId_ = response->value("hostPeerId", hostPeerId_);
     members_.clear();
     for (const auto& id : response->value("peers", json::array())) {
@@ -454,6 +480,7 @@ bool Swarm::sendBinary(const std::shared_ptr<Link>& link, const Bytes& frame) {
 // ----------------------------------------------------------------- protocol
 
 void Swarm::onFrame(const std::shared_ptr<Link>& link, const Bytes& data) {
+  link->lastActivity = Clock::now();
   Peer& peer = peerState(link->remoteId);
   auto frame = decodeFrame(options_.key, data.data(), data.size());
   if (!frame) {
@@ -570,7 +597,26 @@ void Swarm::onManifestPart(const json& message) {
 }
 
 void Swarm::prepareStorage() {
-  if (freeSpace(options_.outputDir) < meta_->size) {
+  // Earlier run of this download (same room, same file)? Resume from it.
+  const auto saved = loadResumeState(options_.outputDir, options_.roomId);
+  const bool sameFile = saved && saved->fileId == meta_->fileId;
+
+  if (sameFile && saved->complete && std::filesystem::exists(saved->savedTo)) {
+    savedTo_ = std::filesystem::path(saved->savedTo);
+    source_ = std::make_unique<FileReader>(*savedTo_, *meta_);
+    have_ = Bitfield::full(meta_->totalChunks);
+    resumedChunks_ = meta_->totalChunks;
+    completed_ = true;
+    event("Already downloaded earlier: " + savedTo_->string() + " (seeding it to other peers)");
+    onReady();
+    return;
+  }
+
+  const auto partPath = PartFile::partPathFor(options_.outputDir, *meta_);
+  const bool resuming = sameFile && !saved->have.empty() && std::filesystem::exists(partPath) &&
+                        std::filesystem::file_size(partPath) == meta_->size;
+
+  if (!resuming && freeSpace(options_.outputDir) < meta_->size) {
     fail("Not enough free disk space in " + options_.outputDir.string() + " for this file.");
     return;
   }
@@ -583,6 +629,16 @@ void Swarm::prepareStorage() {
     return;
   }
   have_ = Bitfield(meta_->totalChunks);
+  if (resuming) {
+    try {
+      have_ = Bitfield::fromBase64(meta_->totalChunks, saved->have);
+      resumedChunks_ = have_->count();
+      event("Resuming: " + std::to_string(resumedChunks_) + " of " + std::to_string(meta_->totalChunks) +
+            " verified chunks restored from the previous run");
+    } catch (const std::exception&) {
+      have_ = Bitfield(meta_->totalChunks);  // corrupt state file: start over
+    }
+  }
   onReady();
 }
 
@@ -607,11 +663,11 @@ void Swarm::onReady() {
     if (!peer.hasMeta) sendMetadata(link, peer);
   }
 
+  if (completed_) return;  // already downloaded earlier: just seed
   if (have_->complete()) {
     finish();
     return;
   }
-  event("Downloading " + meta_->name);
   schedule();
 }
 
@@ -679,6 +735,7 @@ void Swarm::onChunk(const std::shared_ptr<Link>& link, Peer& peer, uint32_t inde
     return;
   }
   have_->set(index);
+  resumeDirty_ = true;
   peer.downloaded += data.size();
   downloadMeter_.add(data.size());
   pendingHaves_.push_back(index);
@@ -699,7 +756,26 @@ void Swarm::finish() {
     fail(std::string("Could not save the file: ") + e.what());
     return;
   }
+  resumeDirty_ = true;
+  persist();
   if (onComplete) onComplete(*savedTo_);
+}
+
+/**
+ * Save the verified bitfield. The .part file is flushed first, so every chunk
+ * the saved bitfield lists is already written.
+ */
+void Swarm::persist() {
+  if (options_.role != Role::Guest || !ready_ || !have_ || !resumeDirty_) return;
+  if (part_) part_->flush();
+  ResumeState state;
+  state.peerId = options_.peerId;
+  state.fileId = meta_->fileId;
+  state.have = have_->toBase64();
+  state.complete = completed_ && savedTo_.has_value();
+  state.savedTo = savedTo_ ? savedTo_->string() : "";
+  if (saveResumeState(options_.outputDir, options_.roomId, state)) resumeDirty_ = false;
+  lastPersist_ = Clock::now();
 }
 
 // ------------------------------------------------------------------- upload
@@ -763,10 +839,14 @@ void Swarm::tick() {
   for (const auto& id : std::vector<std::string>(members_.begin(), members_.end())) ensureLink(id);
 
   // Links that never opened, or stayed "disconnected" too long, have failed.
+  // A crashed peer sends no goodbye over UDP, but the signaling server notices
+  // its socket closing at once (peer-left): if it then also goes quiet, it's gone.
   std::vector<std::shared_ptr<Link>> stale;
   for (const auto& [id, link] : links_) {
+    const bool leftAndQuiet = registered_ && link->open && !members_.count(id) &&
+                              now - link->lastActivity > kLeftPeerSilence;
     if ((!link->open && now - link->createdAt > kConnectTimeout) ||
-        (link->disconnectedAt && now - *link->disconnectedAt > kDisconnectGrace)) {
+        (link->disconnectedAt && now - *link->disconnectedAt > kDisconnectGrace) || leftAndQuiet) {
       stale.push_back(link);
     }
   }
@@ -788,6 +868,7 @@ void Swarm::tick() {
   for (const auto& [id, peer] : peers_) {
     if (!peer.uploadQueue.empty()) pumpUploads(id);
   }
+  if (resumeDirty_ && now - lastPersist_ > kPersistInterval) persist();
 }
 
 uint64_t Swarm::bytesVerified() const {
@@ -836,7 +917,8 @@ SwarmSnapshot Swarm::snapshot() {
                           peer.downloaded, peer.uploaded});
   }
 
-  const std::string signalNote = signaling_ && signaling_->connected() ? "" : " (signaling server unreachable, retrying)";
+  const bool signalingDown = signaling_ && !signaling_->connected() && Clock::now() - startedAt_ > 3s;
+  const std::string signalNote = signalingDown ? " (signaling server unreachable, retrying)" : "";
   if (!fatalError_.empty()) {
     snap.status = "error";
     snap.message = fatalError_;
@@ -855,7 +937,9 @@ SwarmSnapshot Swarm::snapshot() {
     snap.message = "Downloading " + meta_->name + signalNote;
   } else {
     snap.status = "stalled";
-    snap.message = "Connection lost: no connected peer has the remaining chunks. Waiting for the sender to come back...";
+    snap.message =
+        "Connection lost: no connected peer has the remaining chunks. Progress is saved; the download resumes "
+        "automatically from the last verified chunk when the sender (or a peer with the missing chunks) is back.";
   }
   return snap;
 }

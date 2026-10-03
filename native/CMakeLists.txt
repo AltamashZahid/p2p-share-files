@@ -51,6 +51,7 @@ add_library(p2pcore STATIC
   src/core/link.cpp
   src/core/manifest.cpp
   src/core/protocol.cpp
+  src/core/resume.cpp
   src/core/event_loop.cpp
   src/core/signaling.cpp
   src/core/storage.cpp
