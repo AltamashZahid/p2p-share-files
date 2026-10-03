@@ -1,7 +1,7 @@
 #pragma once
 // Compact record of which chunks a peer holds: one bit per chunk, like
 // BitTorrent's bitfield. A 1 GB file (8192 chunks of 128 KB) needs 1 KB.
-// Bit i lives in byte i/8 under mask 1 << (i % 8), the same layout as the web app.
+// Bit i lives in byte i/8 under mask 1 << (i % 8).
 
 #include <cstdint>
 #include <string>
