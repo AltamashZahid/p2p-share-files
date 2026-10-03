@@ -51,6 +51,10 @@ add_library(p2pcore STATIC
   src/core/link.cpp
   src/core/manifest.cpp
   src/core/protocol.cpp
+  src/core/event_loop.cpp
+  src/core/signaling.cpp
+  src/core/storage.cpp
+  src/core/swarm.cpp
 )
 target_include_directories(p2pcore PUBLIC src)
 target_link_libraries(p2pcore PUBLIC
@@ -67,6 +71,9 @@ if(MSVC)
 else()
   target_compile_options(p2pcore PRIVATE -Wall -Wextra)
 endif()
+
+add_executable(p2pshare src/cli/main.cpp)
+target_link_libraries(p2pshare PRIVATE p2pcore ${STATIC_RUNTIME})
 
 add_executable(p2pshare-signal src/server/main.cpp)
 target_link_libraries(p2pshare-signal PRIVATE p2pcore ${STATIC_RUNTIME})
