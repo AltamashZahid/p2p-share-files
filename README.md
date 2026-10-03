@@ -7,7 +7,6 @@ Drop a file, get an invite link, and anyone who opens it downloads the file dire
 | | |
 | --- | --- |
 | 🌐 **Live demo** | _add your Render URL here_ |
-| 🎬 **Demo video** | _add your YouTube / Google Drive link here_ |
 
 ---
 
