@@ -68,6 +68,9 @@ else()
   target_compile_options(p2pcore PRIVATE -Wall -Wextra)
 endif()
 
+add_executable(p2pshare-signal src/server/main.cpp)
+target_link_libraries(p2pshare-signal PRIVATE p2pcore ${STATIC_RUNTIME})
+
 enable_testing()
 add_executable(p2pshare-tests tests/test_core.cpp)
 target_link_libraries(p2pshare-tests PRIVATE p2pcore ${STATIC_RUNTIME})
