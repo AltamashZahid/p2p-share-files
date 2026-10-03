@@ -93,6 +93,7 @@ same_file outC/test.bin && [ "$LATER" -gt "$AT" ] &&
   pass "signaling server killed at $AT%: reached $LATER% without it, then finished" || fail "signaling outage"
 
 stop_all
+sleep 2  # Windows releases file handles of killed processes asynchronously
 rm -rf "$WORK"/test.bin "$WORK"/out*
 echo
 echo "$PASSED passed, $FAILED failed"

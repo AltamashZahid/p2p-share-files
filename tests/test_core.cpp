@@ -104,7 +104,7 @@ void testBitfield() {
   EXPECT(!field.set(9));
   EXPECT(!field.set(10));  // out of range
   EXPECT(field.count() == 2 && field.has(0) && field.has(9) && !field.has(1));
-  // Same byte layout as the web app: bit i -> byte i/8, mask 1 << (i % 8).
+  // Byte layout: bit i -> byte i/8, mask 1 << (i % 8).
   EXPECT(base64urlDecode(field.toBase64()) == (Bytes{0x01, 0x02}));
   const Bitfield copy = Bitfield::fromBase64(10, field.toBase64());
   EXPECT(copy.count() == 2 && copy.has(9));
